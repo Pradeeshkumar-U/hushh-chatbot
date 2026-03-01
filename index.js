@@ -1,111 +1,160 @@
-const express = require('express');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const { createClient } = require('@supabase/supabase-js');
-const dotenv = require('dotenv');
-const cors = require('cors');
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
 const app = express();
-const port = process.env.PORT || 3000;
+app.use(cors());
+app.use(express.json());
 
-// Initialize Supabase Admin
+// Supabase (service role key required)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE
 );
 
-app.use(express.json()); // For regular json endpoints
-app.use(cors());
+// Gemini setup
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-// NEW: Endpoint to create a checkout session
-app.post('/create-checkout-session', async (req, res) => {
-  const { event_id, user_id, amount, title } = req.body;
+/**
+ * Only expose safe parts of your schema
+ */
+const SAFE_SCHEMA = `
+Table: auth.users
+Allowed columns:
+- id
+- email
+- created_at
+- last_sign_in_at
+- is_anonymous
 
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'inr',
-            product_data: {
-              name: title,
-            },
-            unit_amount: amount * 100, // Stripe expects amounts in cents
-          },
-          quantity: 1,
-        },
-      ],
-      mode: 'payment',
-      success_url: 'https://hushh.vercel.app/success', // Your app's success page or redirect
-      cancel_url: 'https://hushh.vercel.app/cancel',
-      metadata: {
-        event_id,
-        user_id,
-      },
-    });
+Rules:
+- Only SELECT queries
+- Never expose passwords, tokens, or secrets
+- Never modify or delete data
+`;
 
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error(`Stripe Error: ${error.message}`);
-    res.status(500).json({ error: error.message });
-  }
-});
+/**
+ * Decide if DB is required
+ */
+async function needsDatabase(question) {
+  const prompt = `
+Classify the intent.
 
-// Stripe Webhook Endpoint (Requires raw body for signature verification)
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
+Reply ONLY:
+DB -> if database info needed
+CHAT -> for general conversation
 
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error(`Webhook Error: ${err.message}`);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  // Handle the event
-  switch (event.type) {
-    case 'checkout.session.completed':
-      const session = event.data.object;
-      await handleSuccessfulPayment(session);
-      break;
-    default:
-      console.log(`Unhandled event type ${event.type}`);
-  }
-
-  res.json({ received: true });
-});
-
-async function handleSuccessfulPayment(session) {
-  const { event_id, user_id } = session.metadata;
-
-  if (!event_id || !user_id) {
-    console.error('Missing metadata in Stripe session');
-    return;
-  }
-
-  console.log(`Processing payment for Event: ${event_id}, User: ${user_id}`);
-
-  // Update payment status in Supabase
-  const { data, error } = await supabase
-    .from('event_registrations')
-    .update({ payment_status: 'paid' })
-    .match({ event_id, user_id });
-
-  if (error) {
-    console.error(`Error updating Supabase: ${error.message}`);
-  } else {
-    console.log('Payment status updated successfully in Supabase');
-  }
+Question: "${question}"
+`;
+  const res = await model.generateContent(prompt);
+  return res.response.text().toUpperCase().includes("DB");
 }
 
-app.listen(port, () => {
-  console.log(`Stripe Webhook Server running on port ${port}`);
+/**
+ * Generate safe SQL
+ */
+async function generateSQL(question) {
+  const prompt = `
+You are a PostgreSQL expert.
+
+${SAFE_SCHEMA}
+
+Generate ONLY a safe SELECT SQL query.
+No explanations. No markdown.
+
+Question: "${question}"
+`;
+
+  const res = await model.generateContent(prompt);
+  let sql = res.response.text().trim();
+
+  if (!sql.toLowerCase().startsWith("select")) {
+    throw new Error("Unsafe query generated");
+  }
+
+  return sql.replace(/```sql|```/g, "");
+}
+
+/**
+ * Execute query (mapped safely)
+ */
+async function runSQL(sql) {
+  // We only allow querying auth.users safely
+  if (sql.toLowerCase().includes("auth.users")) {
+    const { data, error } = await supabase
+      .from("users")
+      .select("id, email, created_at, last_sign_in_at, is_anonymous");
+
+    if (error) throw error;
+    return data;
+  }
+
+  return [];
+}
+
+/**
+ * Creative conversational response
+ */
+async function creativeReply(question, dbData) {
+  const prompt = `
+You are a friendly, witty AI assistant.
+
+User Question:
+${question}
+
+Database Result:
+${JSON.stringify(dbData)}
+
+Respond conversationally, creatively, and clearly.
+Avoid robotic tone.
+`;
+
+  const res = await model.generateContent(prompt);
+  return res.response.text();
+}
+
+/**
+ * Chat API
+ */
+app.post("/chat", async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) {
+      return res.status(400).json({ error: "Message required" });
+    }
+
+    const useDB = await needsDatabase(message);
+
+    // If no DB needed → direct creative response
+    if (!useDB) {
+      const response = await model.generateContent(message);
+      return res.json({ reply: response.response.text() });
+    }
+
+    // Generate SQL safely
+    const sql = await generateSQL(message);
+
+    // Fetch data
+    const dbData = await runSQL(sql);
+
+    // Creative final answer
+    const reply = await creativeReply(message, dbData);
+
+    res.json({
+      reply,
+      debug: { sql, dbData },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
+
+app.listen(process.env.PORT || 3000, () =>
+  console.log("🚀 Gemini Supabase Chatbot running")
+);
