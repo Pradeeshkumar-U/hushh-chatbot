@@ -40,7 +40,7 @@ function cleanSQL(sql) {
 const SAFE_SCHEMA = `
 Allowed tables:
 - public.events
-- public.clubs
+- public.communities
 
 Rules:
 - Only SELECT queries
