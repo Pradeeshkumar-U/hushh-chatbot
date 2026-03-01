@@ -38,21 +38,19 @@ function cleanSQL(sql) {
  * Only SELECT allowed
  */
 const SAFE_SCHEMA = `
-Table: public.profiles
-Columns:
-- id
-- full_name
-- role
-- created_at
+Allowed tables:
+- public.events
+- public.clubs
 
 Rules:
 - Only SELECT queries
 - Never modify or delete data
+- Never expose users, admins, or auth tables
 `;
 
 // Determine if DB is needed
 async function needsDatabase(question) {
-  const prompt = `Reply ONLY "DB" or "CHAT". Question: "${question}"`;
+  const prompt = `Reply ONLY "DB" if database info is needed from events/clubs, else "CHAT". Question: "${question}"`;
   const res = await model.generateContent({
     contents: [{ role: "user", parts: [{ text: prompt }] }],
   });
