@@ -10,162 +10,113 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Supabase (service role key required)
+// ✅ Correct env key
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // Gemini setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-/**
- * Helper: Gemini call wrapper
- */
-async function askGemini(prompt) {
-  const result = await model.generateContent({
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-  });
-
-  return result.response.candidates[0].content.parts[0].text;
+function getText(res) {
+  return res.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 }
 
 /**
- * Only expose safe parts of your schema
+ * Schema: public.profiles
  */
 const SAFE_SCHEMA = `
-Table: auth.users
-Allowed columns:
+Table: public.profiles
+Columns:
 - id
-- email
+- full_name
+- role
 - created_at
-- last_sign_in_at
-- is_anonymous
 
 Rules:
 - Only SELECT queries
-- Never expose passwords, tokens, or secrets
 - Never modify or delete data
 `;
 
-/**
- * Decide if DB is required
- */
 async function needsDatabase(question) {
-  const prompt = `
-Classify the intent.
-
-Reply ONLY:
-DB -> if database info needed
-CHAT -> for general conversation
-
-Question: "${question}"
-`;
-
-  const text = await askGemini(prompt);
-  return text.toUpperCase().includes("DB");
+  const prompt = `Reply ONLY "DB" or "CHAT". Question: "${question}"`;
+  const res = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+  });
+  return getText(res).toUpperCase().includes("DB");
 }
 
-/**
- * Generate safe SQL
- */
 async function generateSQL(question) {
   const prompt = `
 You are a PostgreSQL expert.
-
 ${SAFE_SCHEMA}
-
-Generate ONLY a safe SELECT SQL query.
-No explanations. No markdown.
-
+Generate ONLY a SELECT SQL query.
 Question: "${question}"
 `;
+  const res = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+  });
 
-  let sql = await askGemini(prompt);
-  sql = sql.trim().replace(/```sql|```/g, "");
-
-  if (!sql.toLowerCase().startsWith("select")) {
-    throw new Error("Unsafe query generated");
-  }
+  let sql = getText(res).trim().replace(/```sql|```/g, "");
+  if (!sql.toLowerCase().startsWith("select"))
+    throw new Error("Unsafe query");
 
   return sql;
 }
 
-/**
- * Execute query (mapped safely)
- */
 async function runSQL(sql) {
-  if (sql.toLowerCase().includes("auth.users")) {
+  if (sql.toLowerCase().includes("profiles")) {
     const { data, error } = await supabase
-      .from("users") // Supabase maps auth.users -> users
-      .select("id, email, created_at, last_sign_in_at, is_anonymous");
+      .from("profiles")
+      .select("id, full_name, role, created_at");
 
     if (error) throw error;
     return data;
   }
-
   return [];
 }
 
-/**
- * Creative conversational response
- */
 async function creativeReply(question, dbData) {
   const prompt = `
-You are a friendly, witty AI assistant.
-
-User Question:
-${question}
-
-Database Result:
-${JSON.stringify(dbData)}
-
-Respond conversationally, creatively, and clearly.
-Avoid robotic tone.
+You are a friendly AI assistant.
+User: ${question}
+Database: ${JSON.stringify(dbData)}
+Respond conversationally.
 `;
 
-  return await askGemini(prompt);
+  const res = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+  });
+
+  return getText(res);
 }
 
-/**
- * Chat API
- */
 app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body;
+
     if (!message) {
       return res.status(400).json({ error: "Message required" });
     }
 
     const useDB = await needsDatabase(message);
 
-    // CHAT ONLY
     if (!useDB) {
-      const reply = await askGemini(message);
-      return res.json({ reply });
+      const response = await model.generateContent({
+        contents: [{ role: "user", parts: [{ text: message }] }],
+      });
+      return res.json({ reply: getText(response) });
     }
 
-    // Generate SQL safely
     const sql = await generateSQL(message);
-
-    // Fetch data
     const dbData = await runSQL(sql);
-
-    // Creative final answer
     const reply = await creativeReply(message, dbData);
 
-    res.json({
-      reply,
-      debug: { sql, dbData },
-    });
+    res.json({ reply, debug: { sql, dbData } });
   } catch (err) {
-    console.error(err);
+    console.error("❌ ERROR:", err);
     res.status(500).json({ error: err.message });
   }
 });
