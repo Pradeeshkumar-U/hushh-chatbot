@@ -21,6 +21,22 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 /**
+ * Helper: Gemini call wrapper
+ */
+async function askGemini(prompt) {
+  const result = await model.generateContent({
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ],
+  });
+
+  return result.response.candidates[0].content.parts[0].text;
+}
+
+/**
  * Only expose safe parts of your schema
  */
 const SAFE_SCHEMA = `
@@ -51,8 +67,9 @@ CHAT -> for general conversation
 
 Question: "${question}"
 `;
-  const res = await model.generateContent(prompt);
-  return res.response.text().toUpperCase().includes("DB");
+
+  const text = await askGemini(prompt);
+  return text.toUpperCase().includes("DB");
 }
 
 /**
@@ -70,24 +87,23 @@ No explanations. No markdown.
 Question: "${question}"
 `;
 
-  const res = await model.generateContent(prompt);
-  let sql = res.response.text().trim();
+  let sql = await askGemini(prompt);
+  sql = sql.trim().replace(/```sql|```/g, "");
 
   if (!sql.toLowerCase().startsWith("select")) {
     throw new Error("Unsafe query generated");
   }
 
-  return sql.replace(/```sql|```/g, "");
+  return sql;
 }
 
 /**
  * Execute query (mapped safely)
  */
 async function runSQL(sql) {
-  // We only allow querying auth.users safely
   if (sql.toLowerCase().includes("auth.users")) {
     const { data, error } = await supabase
-      .from("users")
+      .from("users") // Supabase maps auth.users -> users
       .select("id, email, created_at, last_sign_in_at, is_anonymous");
 
     if (error) throw error;
@@ -114,8 +130,7 @@ Respond conversationally, creatively, and clearly.
 Avoid robotic tone.
 `;
 
-  const res = await model.generateContent(prompt);
-  return res.response.text();
+  return await askGemini(prompt);
 }
 
 /**
@@ -130,10 +145,10 @@ app.post("/chat", async (req, res) => {
 
     const useDB = await needsDatabase(message);
 
-    // If no DB needed → direct creative response
+    // CHAT ONLY
     if (!useDB) {
-      const response = await model.generateContent(message);
-      return res.json({ reply: response.response.text() });
+      const reply = await askGemini(message);
+      return res.json({ reply });
     }
 
     // Generate SQL safely
