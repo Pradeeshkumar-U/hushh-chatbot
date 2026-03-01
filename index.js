@@ -18,7 +18,7 @@ const supabase = createClient(
 
 // Gemini setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-001" });
+const model = genAI.getGenerativeModel({ model: "models/gemini-2.0-flash-001" });
 
 function getText(res) {
   return res.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
